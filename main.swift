@@ -1,5 +1,13 @@
 import Cocoa
 import ApplicationServices
+import IOKit.hid
+
+// MARK: - 双通道说明
+// 远控软件（如 UU 远程）在 HID 层就把按键截走，CGEvent 层完全看不到。
+// 但公开的 IOHIDManager 监听仍能读到这些按键，因此这里用双通道：
+//   上层 CGEventTap —— 能拦则拦（本机场景不脏，空格正常被吞）
+//   底层 HID 监听 —— 只读感知（UU 场景兜底触发，代价是漏一个空格到远端）
+// 注：HID 层的「过滤/吞掉事件」需要苹果私有授权（entitlement），普通签名拿不到，实测注册成功但回调永不触发，已放弃。
 
 // MARK: - 配置（默认值 = 实测可用组合；改 ~/.voicebridge/config.json 后重启生效）
 struct VBConfig: Codable {
@@ -121,6 +129,9 @@ final class Bridge: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var tap: CFMachPort?
     var src: CGEventSource!
+    var hidManager: IOHIDManager?
+    var lastTriggerAt = Date.distantPast
+    var hidOwnsPress = false
 
     var holding = false
     var recording = false
@@ -142,6 +153,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
         buildStatusItem()
         buildPanel()
         checkPermissions()
+        setupHIDMonitor()
         installTap()
         startConfigWatcher()
         log("VoiceBridge 已启动 · 按住\(keyName(cfg.triggerKeyCode))说话，唤起豆包用 \(keyName(cfg.doubaoKeyCode)) · 松开自动粘贴到远端")
@@ -346,6 +358,61 @@ final class Bridge: NSObject, NSApplicationDelegate {
         return NSPoint(x: f.midX - w / 2, y: f.minY + 40)
     }
 
+    // MARK: HID 层监听（诊断：验证能否在比 CGEvent 更底层看到空格）
+    func setupHIDMonitor() {
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let matching: [String: Any] = [
+            kIOHIDDeviceUsagePageKey as String: 0x01,
+            kIOHIDDeviceUsageKey as String: 0x06
+        ]
+        IOHIDManagerSetDeviceMatching(mgr, matching as CFDictionary)
+
+        let callback: IOHIDValueCallback = { _, _, _, value in
+            let elem = IOHIDValueGetElement(value)
+            let page = IOHIDElementGetUsagePage(elem)
+            let usage = IOHIDElementGetUsage(elem)
+            let v = IOHIDValueGetIntegerValue(value)
+            guard page == 7 else { return }
+            if usage == 44 {
+                FileHandle.standardError.write("[HID] 空格\(v != 0 ? "按下" : "抬起")\n".data(using: .utf8)!)
+                DispatchQueue.main.async {
+                    if v != 0 {
+                        if Date().timeIntervalSince(bridge.lastTriggerAt) < 0.3 {
+                            bridge.hidOwnsPress = false
+                            return
+                        }
+                        bridge.hidOwnsPress = true
+                        bridge.hidTriggerPressed()
+                    } else {
+                        if bridge.hidOwnsPress {
+                            bridge.hidOwnsPress = false
+                            bridge.hidTriggerReleased()
+                        }
+                    }
+                }
+            }
+        }
+        IOHIDManagerRegisterInputValueCallback(mgr, callback, nil)
+        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        let r = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        FileHandle.standardError.write("[HID] 监听注册: \(r == kIOReturnSuccess ? "成功" : "失败 \(r)")\n".data(using: .utf8)!)
+        hidManager = mgr
+    }
+
+    // MARK: HID 兜底触发（底层只读：远控软件拿走事件后，CGEvent 层看不到，但这里能看到）
+    func hidTriggerPressed() {
+        guard cfg.triggerKeyCode == 49 else { return }
+        log("[HID] 触发键按下")
+        beginHold()
+    }
+
+    func hidTriggerReleased() {
+        guard cfg.triggerKeyCode == 49 else { return }
+        log("[HID] 触发键松开")
+        cancelPendingStart()
+        if recording { stopRecording() }
+    }
+
     // MARK: 事件监听
     func installTap() {
         guard tap == nil else { return }
@@ -420,6 +487,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
             if type == .keyDown {
                 let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
                 if isRepeat { return nil }
+                lastTriggerAt = Date()
                 beginHold()
                 return nil
             }
