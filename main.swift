@@ -15,9 +15,10 @@ struct VBConfig: Codable {
     var doubaoKeyCode: Int64    // 唤起豆包语音的键（默认 59 = 左侧 Control）
     var armDelay: Double        // 按住多久才开录（防误触）
     var clipboardWait: Double   // 写剪贴板到按 Cmd+V 的等待（留 UU 同步时间）
+    var uuTargetDevice: String  // 只粘到含该设备名的 UU 控制窗口；空 = 当前窗口
 
     static let `default` = VBConfig(triggerKeyCode: 49, doubaoKeyCode: 59,
-                                    armDelay: 0.35, clipboardWait: 0.85)
+                                    armDelay: 0.35, clipboardWait: 1.3, uuTargetDevice: "")
 }
 
 let vbConfigDir = NSHomeDirectory() + "/.voicebridge"
@@ -42,6 +43,8 @@ func saveConfig() {
     doubaoKeyCode: \(cfg.doubaoKeyCode)
     armDelay: \(cfg.armDelay)
     clipboardWait: \(cfg.clipboardWait)
+    # uuTargetDevice：只粘到窗口内出现该设备名的 UU 控制窗口，留空=粘到当前窗口
+    uuTargetDevice: \(cfg.uuTargetDevice)
 
     """
     try? FileManager.default.createDirectory(atPath: vbConfigDir, withIntermediateDirectories: true)
@@ -66,6 +69,7 @@ func loadConfig() -> VBConfig {
         case "doubaoKeyCode":  if let v = Int64(val) { c.doubaoKeyCode = v }
         case "armDelay":       if let v = Double(val) { c.armDelay = v }
         case "clipboardWait":  if let v = Double(val) { c.clipboardWait = v }
+        case "uuTargetDevice": c.uuTargetDevice = val
         default: break
         }
     }
@@ -75,6 +79,61 @@ func loadConfig() -> VBConfig {
 let kVKey: CGKeyCode = 9
 let uuBundleID = "com.netease.uuremote"
 let uuActivateWait: Double = 0.45
+
+// 递归收集 AX 元素里的文本
+func axCollectTexts(_ el: AXUIElement, _ depth: Int, _ acc: inout [String]) {
+    if depth > 12 || acc.count > 120 { return }
+    for attr in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+        var v: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success,
+           let s = v as? String {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { acc.append(t) }
+        }
+    }
+    var ch: CFTypeRef?
+    if AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &ch) == .success,
+       let kids = ch as? [AXUIElement] {
+        for k in kids { axCollectTexts(k, depth + 1, &acc) }
+    }
+}
+
+// 枚举 UU 的控制窗口，返回 (窗口元素, 设备名)
+var uuWinCacheAt = Date.distantPast
+var uuWinCache: [(AXUIElement, String)] = []
+
+func uuControlWindows(useCache: Bool = false) -> [(AXUIElement, String)] {
+    if useCache, Date().timeIntervalSince(uuWinCacheAt) < 2.0 { return uuWinCache }
+    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: uuBundleID).first else { return [] }
+    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    var winsRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success,
+          let wins = winsRef as? [AXUIElement] else { return [] }
+    let timeRe = try? NSRegularExpression(pattern: "^\\d{1,2}:\\d{2}:\\d{2}$")
+    var out: [(AXUIElement, String)] = []
+    for w in wins {
+        var texts: [String] = []
+        axCollectTexts(w, 0, &texts)
+        // 控制窗口的判据：窗口里带“显示屏”，主界面没有
+        guard texts.contains(where: { $0.contains("显示屏") }) else { continue }
+        for t in texts {
+            if t.hasPrefix("control icon") || t.hasPrefix("icon ") || t.hasPrefix("fixed floating") { continue }
+            if t.contains("显示屏") || t == "控制中心" { continue }
+            if let re = timeRe,
+               re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil { continue }
+            out.append((w, t))
+            break
+        }
+    }
+    uuWinCache = out
+    uuWinCacheAt = Date()
+    return out
+}
+
+// 让粘贴路径复用缓存，避免每轮都遍历整棵 AX 树
+func uuControlWindowsCached() -> [(AXUIElement, String)] {
+    return uuControlWindows(useCache: true)
+}
 
 // 修饰键 → CGEventFlags（既用于合成豆包快捷键，也用于识别修饰键型触发键）
 let modifierFlags: [Int64: CGEventFlags] = [
@@ -122,11 +181,13 @@ final class KeyPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-final class Bridge: NSObject, NSApplicationDelegate {
+final class Bridge: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var panel: KeyPanel!
     var textView: NSTextView!
     var caption: NSTextField!
     var statusItem: NSStatusItem!
+    var targetSubmenu: NSMenu?
+    var passSpaceEvents = 0   // 短按补发的空格要放行，避免被自己的监听再次截获
     var tap: CFMachPort?
     var src: CGEventSource!
     var hidManager: IOHIDManager?
@@ -179,7 +240,9 @@ final class Bridge: NSObject, NSApplicationDelegate {
     }
 
     func log(_ s: String) {
-        print(s)
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        print("[\(f.string(from: Date()))] \(s)")
         fflush(stdout)
     }
 
@@ -253,6 +316,15 @@ final class Bridge: NSObject, NSApplicationDelegate {
         arm.submenu = armSub
         menu.addItem(arm)
 
+        // 粘贴目标（UU 多窗口）
+        let curTarget = cfg.uuTargetDevice.isEmpty ? "自动（当前窗口）" : cfg.uuTargetDevice
+        let tgt = NSMenuItem(title: "粘贴目标：\(curTarget)", action: nil, keyEquivalent: "")
+        let tgtSub = NSMenu()
+        targetSubmenu = tgtSub
+        fillTargetItems(tgtSub)
+        tgt.submenu = tgtSub
+        menu.addItem(tgt)
+
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "打开配置文件", action: #selector(openConfig), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -260,7 +332,48 @@ final class Bridge: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "打开输入监控设置", action: #selector(openIMSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    // 填充“粘贴目标”子菜单（打开菜单时刷新，能列出当前的 UU 控制窗口）
+    func fillTargetItems(_ sub: NSMenu) {
+        sub.removeAllItems()
+        let autoIt = NSMenuItem(title: "自动（当前窗口）", action: #selector(setUUTarget(_:)), keyEquivalent: "")
+        autoIt.tag = -1
+        autoIt.target = self
+        autoIt.state = cfg.uuTargetDevice.isEmpty ? .on : .off
+        sub.addItem(autoIt)
+        let wins = uuControlWindows()
+        if wins.isEmpty {
+            let none = NSMenuItem(title: "没检测到 UU 控制窗口", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            sub.addItem(none)
+        } else {
+            sub.addItem(NSMenuItem.separator())
+            for (_, name) in wins {
+                let it = NSMenuItem(title: name, action: #selector(setUUTarget(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = name
+                it.state = name == cfg.uuTargetDevice ? .on : .off
+                sub.addItem(it)
+            }
+        }
+    }
+
+    @objc func setUUTarget(_ sender: NSMenuItem) {
+        if sender.tag == -1 {
+            cfg.uuTargetDevice = ""
+        } else if let n = sender.representedObject as? String {
+            cfg.uuTargetDevice = n
+        }
+        saveConfig()
+        rebuildMenu()
+        log("[配置] 粘贴目标 → \(cfg.uuTargetDevice.isEmpty ? "自动" : cfg.uuTargetDevice)")
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        if let sub = targetSubmenu { fillTargetItems(sub) }
     }
 
     @objc func setTriggerKey(_ sender: NSMenuItem) {
@@ -296,7 +409,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
 
     // MARK: 浮窗
     func buildPanel() {
-        let w: CGFloat = 780, h: CGFloat = 150
+        let w: CGFloat = 620, h: CGFloat = 112
         panel = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                          styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         panel.titlebarAppearsTransparent = true
@@ -311,12 +424,12 @@ final class Bridge: NSObject, NSApplicationDelegate {
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 0.92).cgColor
-        container.layer?.cornerRadius = 18
+        container.layer?.backgroundColor = NSColor(calibratedWhite: 0.05, alpha: 0.72).cgColor
+        container.layer?.cornerRadius = 16
         container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.18).cgColor
+        container.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.12).cgColor
 
-        let scroll = NSScrollView(frame: NSRect(x: 22, y: 46, width: w - 44, height: h - 66))
+        let scroll = NSScrollView(frame: NSRect(x: 18, y: 34, width: w - 36, height: h - 50))
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = false
         scroll.borderType = .noBorder
@@ -329,7 +442,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
         tv.autoresizingMask = [.width]
         tv.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: .greatestFiniteMagnitude)
         tv.textContainer?.widthTracksTextView = true
-        tv.font = NSFont.systemFont(ofSize: 20)
+        tv.font = NSFont.systemFont(ofSize: 17)
         tv.textColor = .white
         tv.insertionPointColor = .white
         tv.drawsBackground = false
@@ -338,7 +451,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
         textView = tv
         container.addSubview(scroll)
 
-        let cap = NSTextField(frame: NSRect(x: 24, y: 14, width: w - 48, height: 22))
+        let cap = NSTextField(frame: NSRect(x: 20, y: 10, width: w - 40, height: 20))
         cap.isEditable = false
         cap.isBordered = false
         cap.drawsBackground = false
@@ -477,6 +590,10 @@ final class Bridge: NSObject, NSApplicationDelegate {
             return Unmanaged.passUnretained(event)
         }
         guard type == .keyDown || type == .keyUp || type == .flagsChanged else { return Unmanaged.passUnretained(event) }
+        if passSpaceEvents > 0 {
+            passSpaceEvents -= 1
+            return Unmanaged.passUnretained(event)
+        }
         let code = event.getIntegerValueField(.keyboardEventKeycode)
         if code == cfg.triggerKeyCode {
             // 修饰键型触发键（如右侧 Command）：走 flagsChanged，且不吞事件，以免破坏其它组合键
@@ -492,7 +609,16 @@ final class Bridge: NSObject, NSApplicationDelegate {
                 return nil
             }
             if type == .keyUp {
+                let wasRecording = recording
                 cancelPendingStart()
+                if !wasRecording {
+                    // 短按（没到按住时长）：补发一个空格，保持轻敲空格的原功能
+                    passSpaceEvents = 2
+                    let src = CGEventSource(stateID: .hidSystemState)
+                    CGEvent(keyboardEventSource: src, virtualKey: 49, keyDown: true)?.post(tap: .cghidEventTap)
+                    CGEvent(keyboardEventSource: src, virtualKey: 49, keyDown: false)?.post(tap: .cghidEventTap)
+                    log("[短按] 补发空格")
+                }
                 return nil
             }
             return Unmanaged.passUnretained(event)
@@ -606,7 +732,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
             } else {
                 stable += 1
             }
-            let stableEnough = stable >= 4 && !s.isEmpty
+            let stableEnough = stable >= 2 && !s.isEmpty
             let tooLong = ticks > 28   // ~7s
             if stableEnough || tooLong {
                 done(s)
@@ -635,12 +761,22 @@ final class Bridge: NSObject, NSApplicationDelegate {
         pb.setString(clean, forType: .string)
         log("[剪贴板] 已写入 \(clean.count) 字")
         hidePanel()
-        activateUU()
+        guard activateUU() else {
+            log("[UU] 目标窗口不可用，跳过本次粘贴")
+            busy = false
+            installTap()
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + cfg.clipboardWait) { [weak self] in
             self?.sendCmdV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self?.busy = false
                 self?.installTap()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self = self else { return }
+                let cur = NSPasteboard.general.string(forType: .string) ?? "(空)"
+                self.log("[回读] 剪贴板=\(cur.prefix(40)) cc=\(NSPasteboard.general.changeCount)")
             }
         }
     }
@@ -650,14 +786,39 @@ final class Bridge: NSObject, NSApplicationDelegate {
         NSApp.hide(nil)
     }
 
-    func activateUU() {
-        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: uuBundleID)
-        if let app = apps.first {
-            app.activate(options: [.activateAllWindows])
-            log("[UU] 已激活")
-        } else {
+    @discardableResult
+    func activateUU() -> Bool {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: uuBundleID).first else {
             log("!! 没找到 UU 远程进程")
+            return false
         }
+        let target = cfg.uuTargetDevice.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !target.isEmpty {
+            let wins = uuControlWindowsCached()
+            let hit = wins.first { $0.1.contains(target) || target.contains($0.1) }
+            if let (win, name) = hit {
+                // 只激活 App（不把所有窗口挤到前台），再把命中的窗口置前
+                app.activate(options: [])
+                let r = AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+                log("[UU] 目标窗口已置前：\(name) raise=\(r.rawValue)")
+                return true
+            }
+            log("[UU] 没找到设备窗口「\(target)」；当前枚举到 \(wins.count) 个：\(wins.map { $0.1 }.joined(separator: " / "))")
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var wref: CFTypeRef?
+            let err = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &wref)
+            let wl = (wref as? [AXUIElement]) ?? []
+            log("[UU] AX诊断 err=\(err.rawValue) windows=\(wl.count) trusted=\(AXIsProcessTrusted())")
+            if let first = wl.first {
+                var tt: [String] = []
+                axCollectTexts(first, 0, &tt)
+                log("[UU] 窗口0文本数=\(tt.count) 前5=\(tt.prefix(5).joined(separator: " | "))")
+            }
+            return false
+        }
+        app.activate(options: [])
+        log("[UU] 已激活")
+        return true
     }
 
     func sendCmdV() {
@@ -673,7 +834,7 @@ final class Bridge: NSObject, NSApplicationDelegate {
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)
 let bridge = Bridge()
 app.delegate = bridge
 app.run()
